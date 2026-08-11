@@ -6,13 +6,18 @@
 //! # Performance design
 //!
 //! - The only component subscribed to the viewport signal is [`ViewportFrame`]
-//!   (background layer + two transform divs). Panning/zooming re-renders just
-//!   those three divs; the scene itself is memoized behind `PartialEq` props.
-//! - During a pan drag the transform div is also written **synchronously**
-//!   (`style.left/top` via `web-sys`) inside the pointer handler, so the view
-//!   tracks the cursor without waiting for Dioxus' async render scheduling.
-//!   The signal is updated in the same handler, so the eventual re-render
-//!   produces identical styles and never jumps.
+//!   (transform layer + zoom layer). Panning re-renders just those divs; the
+//!   scene itself is memoized behind `PartialEq` props.
+//! - Panning uses `transform: translate()` (compositor-only, no layout or
+//!   repaint) and is also written **synchronously** inside the pointer
+//!   handler, so the view tracks the cursor without waiting for Dioxus'
+//!   async render scheduling. The signal is updated in the same handler, so
+//!   the eventual re-render produces identical styles and never jumps.
+//! - The dotted background lives inside the transformed layer (fixed 20px
+//!   spacing in graph coordinates) instead of animating `background-position`
+//!   — animating gradient backgrounds forces a full re-raster every frame.
+//! - Zooming keeps CSS `zoom` so text stays sharp (re-raster per wheel tick
+//!   is acceptable; it is not a per-pointer-frame path).
 //! - Node dragging reports through `on_node_move`; how callers apply it
 //!   (and its re-render cost) is the caller's choice.
 
@@ -323,12 +328,13 @@ pub fn FlowCanvas(
                             y: origin.y + point.y - start.y,
                             zoom: current.zoom,
                         };
-                        // 同步直写变换层，消除渲染调度延迟（不跟手的来源）。
-                        // signal 随后渲染出相同样式，不会跳变。
+                        // 同步直写 transform（合成器层，无 layout/repaint），
+                        // 消除渲染调度延迟；signal 随后渲染出相同样式，不会跳变。
                         if let Some(el) = frame_for_move.borrow().as_ref() {
-                            let style = el.style();
-                            let _ = style.set_property("left", &format!("{}px", next.x));
-                            let _ = style.set_property("top", &format!("{}px", next.y));
+                            let _ = el.style().set_property(
+                                "transform",
+                                &format!("translate({}px, {}px)", next.x, next.y),
+                            );
                         }
                         viewport.set(next);
                     }
@@ -385,7 +391,10 @@ pub fn FlowCanvas(
 }
 
 /// 视口帧：唯一订阅 viewport signal 的组件。
-/// 平移/缩放时只有这里的背景层和两个变换 div 逐帧更新。
+/// 平移 = transform: translate（合成器层，无 layout/repaint）；
+/// 缩放 = CSS zoom（重栅格化保证文字清晰）。
+/// 点阵背景放在变换层内部（图坐标固定点距），随平移/缩放自然移动，
+/// 不做 background-position/size 的逐帧更新（渐变重光栅是性能陷阱）。
 #[component]
 fn ViewportFrame(
     viewport: Signal<Viewport>,
@@ -393,31 +402,25 @@ fn ViewportFrame(
     frame_ref: Rc<RefCell<Option<web_sys::HtmlElement>>>,
     children: Element,
 ) -> Element {
-    let current_viewport = viewport();
-    let background_size = 20.0 * current_viewport.zoom;
-    let background_position = format!(
-        "{}px {}px",
-        current_viewport.x.rem_euclid(background_size),
-        current_viewport.y.rem_euclid(background_size)
-    );
-    let viewport_transition = if animate {
-        "transition: left 0.35s ease, top 0.35s ease, zoom 0.35s ease;"
+    let vp = viewport();
+    let transition = if animate {
+        "transition: transform 0.35s ease, zoom 0.35s ease;"
     } else {
         ""
     };
     rsx! {
-        // 点阵背景随视口滚动（等比缩放点距）
         div {
-            style: "position: absolute; inset: 0; pointer-events: none; background-image: radial-gradient(circle, color-mix(in srgb, currentColor 18%, transparent) 1px, transparent 1px); background-size: {background_size}px {background_size}px; background-position: {background_position};",
-        }
-        div {
-            style: "position: absolute; left: {current_viewport.x}px; top: {current_viewport.y}px; {viewport_transition}",
+            style: "position: absolute; left: 0; top: 0; transform: translate({vp.x}px, {vp.y}px); will-change: transform; {transition}",
             onmounted: move |event| {
                 *frame_ref.borrow_mut() =
                     event.data().downcast::<web_sys::HtmlElement>().cloned();
             },
             div {
-                style: "zoom: {current_viewport.zoom}; {viewport_transition}",
+                style: "zoom: {vp.zoom}; {transition}",
+                // 点阵背景：图坐标固定 20px 点距，覆盖以原点为中心的大范围区域
+                div {
+                    style: "position: absolute; left: -5000px; top: -5000px; width: 10000px; height: 10000px; pointer-events: none; background-image: radial-gradient(circle, color-mix(in srgb, currentColor 18%, transparent) 1px, transparent 1px); background-size: 20px 20px;",
+                }
                 {children}
             }
         }
