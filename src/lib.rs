@@ -196,10 +196,15 @@ fn dots_position(viewport: Viewport) -> (f64, f64) {
 
 /// 一次平移拖拽会话：window 级原生 pointermove/pointerup 监听。
 ///
-/// 绕过 Dioxus 事件层——高频指针事件经框架事件反序列化 + 渲染调度是
-/// 拖拽不跟手的来源。事件内同步直写 transform（场景，合成器层）与
-/// background-position（点阵，贴图位移），并同步更新 viewport signal
-/// 保持状态一致（随后的重渲染写出相同值，不会跳变）。
+/// 设计要点（对照 xyflow 与 Dioxus 0.7 渲染机制的调研结论）：
+/// - 拖拽期间**只直写 DOM**（场景 transform + 点阵 background-position），
+///   完全不做 signal.set——Dioxus 的渲染在绘制前的 microtask 里同步执行，
+///   每次 set 的渲染工作都会挡住直写结果上屏；
+/// - pointerup / pointercancel / blur 时一次性提交 viewport signal，
+///   随后的重渲染写出相同值，无缝衔接；
+/// - 拖拽期间若发生无关渲染，ViewportFrame 会以旧 signal 值重写 style
+///   造成瞬跳，因此提供 on_pan_start/on_pan_end 让调用方抑制此类更新
+///   （如节点 hover 高亮）。
 struct PanSession {
     window: web_sys::Window,
     move_cb: Closure<dyn FnMut(web_sys::PointerEvent)>,
@@ -213,68 +218,85 @@ impl PanSession {
         frame: Rc<RefCell<Option<web_sys::HtmlElement>>>,
         dots: Rc<RefCell<Option<web_sys::HtmlElement>>>,
         slot: Rc<RefCell<Option<PanSession>>>,
+        on_pan_start: EventHandler<()>,
+        on_pan_end: EventHandler<()>,
     ) -> Option<()> {
         let window = web_sys::window()?;
         let current = viewport();
         let origin = Point::new(current.x, current.y);
+        let latest = Rc::new(RefCell::new(current));
 
         let move_cb = {
-            let mut viewport = viewport;
+            let latest = latest.clone();
             Closure::wrap(Box::new(move |e: web_sys::PointerEvent| {
                 let nx = origin.x + e.client_x() as f64 - start.x;
                 let ny = origin.y + e.client_y() as f64 - start.y;
+                let mut vp = *latest.borrow();
+                vp.x = nx;
+                vp.y = ny;
+                *latest.borrow_mut() = vp;
                 if let Some(el) = frame.borrow().as_ref() {
                     let _ = el
                         .style()
                         .set_property("transform", &format!("translate({nx}px, {ny}px)"));
                 }
                 if let Some(el) = dots.borrow().as_ref() {
-                    let mut vp = viewport();
-                    vp.x = nx;
-                    vp.y = ny;
                     let (bg_x, bg_y) = dots_position(vp);
                     let _ = el
                         .style()
                         .set_property("background-position", &format!("{bg_x}px {bg_y}px"));
                 }
-                let mut vp = viewport();
-                vp.x = nx;
-                vp.y = ny;
-                viewport.set(vp);
             }) as Box<dyn FnMut(_)>)
+        };
+        let finish = move |slot: &Rc<RefCell<Option<PanSession>>>,
+                         latest: &Rc<RefCell<Viewport>>,
+                         mut viewport: Signal<Viewport>,
+                         on_pan_end: EventHandler<()>| {
+            // 只移除监听器，不 drop session（当前正在其回调中，slot 中的
+            // 实例留待下次平移或卸载时回收，Drop 幂等）。
+            if let Some(session) = slot.borrow().as_ref() {
+                session.remove();
+            }
+            viewport.set(*latest.borrow());
+            on_pan_end.call(());
         };
         let up_cb = {
             let slot = slot.clone();
+            let latest = latest.clone();
             Closure::wrap(Box::new(move |_e: web_sys::PointerEvent| {
-                // 从 slot 中移除监听器（取走会顺带 drop，先显式 remove）
-                if let Some(session) = slot.borrow_mut().take() {
-                    session.remove();
-                }
+                finish(&slot, &latest, viewport, on_pan_end);
             }) as Box<dyn FnMut(_)>)
         };
         let _ = window.add_event_listener_with_callback(
             "pointermove",
             move_cb.as_ref().unchecked_ref(),
         );
+        // pointerup / pointercancel / blur 都视为结束
         let _ = window
             .add_event_listener_with_callback("pointerup", up_cb.as_ref().unchecked_ref());
+        let _ = window
+            .add_event_listener_with_callback("pointercancel", up_cb.as_ref().unchecked_ref());
+        let _ = window.add_event_listener_with_callback("blur", up_cb.as_ref().unchecked_ref());
         *slot.borrow_mut() = Some(PanSession {
             window,
             move_cb,
             up_cb,
         });
+        on_pan_start.call(());
         Some(())
     }
 
     fn remove(&self) {
-        let _ = self.window.remove_event_listener_with_callback(
-            "pointermove",
-            self.move_cb.as_ref().unchecked_ref(),
-        );
-        let _ = self.window.remove_event_listener_with_callback(
-            "pointerup",
-            self.up_cb.as_ref().unchecked_ref(),
-        );
+        for (name, cb) in [
+            ("pointermove", &self.move_cb),
+            ("pointerup", &self.up_cb),
+            ("pointercancel", &self.up_cb),
+            ("blur", &self.up_cb),
+        ] {
+            let _ = self
+                .window
+                .remove_event_listener_with_callback(name, cb.as_ref().unchecked_ref());
+        }
     }
 }
 
@@ -360,6 +382,11 @@ pub fn FlowCanvas(
     /// Smoothly animate viewport changes (programmatic fit/reset).
     /// Keep disabled while the user is dragging.
     #[props(default = false)] animate: bool,
+    /// 平移拖拽开始/结束（原生 pointer 会话的生命周期）。
+    /// 调用方应在拖拽期间抑制会触发无关渲染的更新（如 hover 高亮），
+    /// 否则渲染会以旧 signal 值重写 style 造成瞬跳。
+    #[props(default)] on_pan_start: EventHandler<()>,
+    #[props(default)] on_pan_end: EventHandler<()>,
     #[props(default)] empty: Option<Element>,
 ) -> Element {
     let canvas_id = use_hook(|| NEXT_CANVAS_ID.fetch_add(1, Ordering::Relaxed));
@@ -420,6 +447,8 @@ pub fn FlowCanvas(
                     frame_for_down.clone(),
                     dots_for_down.clone(),
                     pan_for_down.clone(),
+                    on_pan_start,
+                    on_pan_end,
                 );
             },
             onmousemove: move |event| {
