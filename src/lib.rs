@@ -535,14 +535,20 @@ fn ViewportFrame(
             style: "position: absolute; inset: 0; pointer-events: none; background-image: {DOTS_TILE}; background-repeat: repeat; background-size: {bg_size}px {bg_size}px; background-position: {bg_x}px {bg_y}px;",
             onmounted: move |event| {
                 *dots_ref.borrow_mut() =
-                    event.data().downcast::<web_sys::HtmlElement>().cloned();
+                    // MountedData 的 backing 是 web_sys::Element，
+                    // downcast 到 HtmlElement 永远是 None——先拿 Element 再转
+                    event.data().downcast::<web_sys::Element>().cloned()
+                        .map(|el| el.unchecked_into::<web_sys::HtmlElement>());
             },
         }
         div {
             style: "position: absolute; left: 0; top: 0; transform: translate({vp.x}px, {vp.y}px); will-change: transform; {transition}",
             onmounted: move |event| {
                 *frame_ref.borrow_mut() =
-                    event.data().downcast::<web_sys::HtmlElement>().cloned();
+                    // MountedData 的 backing 是 web_sys::Element，
+                    // downcast 到 HtmlElement 永远是 None——先拿 Element 再转
+                    event.data().downcast::<web_sys::Element>().cloned()
+                        .map(|el| el.unchecked_into::<web_sys::HtmlElement>());
             },
             div {
                 style: "zoom: {vp.zoom}; {transition}",
