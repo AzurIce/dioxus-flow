@@ -226,8 +226,15 @@ impl PanSession {
         let origin = Point::new(current.x, current.y);
         let latest = Rc::new(RefCell::new(current));
 
+        // Dioxus 0.7 写 style 时的"保存-覆盖-恢复"逻辑会让内联 transition
+        // 一旦写入就无法移除（#4389），拖拽前强制关掉，避免 transform 被补间。
+        if let Some(el) = frame.borrow().as_ref() {
+            let _ = el.style().set_property("transition", "none");
+        }
+
         let move_cb = {
             let latest = latest.clone();
+            let frame = frame.clone();
             Closure::wrap(Box::new(move |e: web_sys::PointerEvent| {
                 let nx = origin.x + e.client_x() as f64 - start.x;
                 let ny = origin.y + e.client_y() as f64 - start.y;
@@ -258,6 +265,11 @@ impl PanSession {
             // 实例留待下次平移或卸载时回收，Drop 幂等）。
             if let Some(session) = slot.borrow().as_ref() {
                 session.remove();
+            }
+            // 恢复拖拽开始时强制关掉的 transition（内联优先级高于 class，
+            // 不移除会让后续 fit 动画失效）
+            if let Some(el) = frame.borrow().as_ref() {
+                let _ = el.style().remove_property("transition");
             }
             viewport.set(*latest.borrow());
             on_pan_end.call(());
@@ -525,11 +537,6 @@ fn ViewportFrame(
     children: Element,
 ) -> Element {
     let vp = viewport();
-    let transition = if animate {
-        "transition: transform 0.35s ease;"
-    } else {
-        ""
-    };
     let bg_size = 20.0 * vp.zoom;
     let (bg_x, bg_y) = dots_position(vp);
     rsx! {
@@ -547,8 +554,11 @@ fn ViewportFrame(
         // 不用 CSS zoom——zoom 在 composited transform 层内的重绘行为
         // 在非标准边界上，会导致子树不随 transform 即时移动。
         // scale 期间文字短暂模糊，停止缩放后浏览器会按最终比例重光栅。
+        // 过渡动画用 class 控制（.flow-frame--animate 由调用方 CSS 提供）——
+        // 内联 style 的 transition 会被 Dioxus 的 style 保存/恢复逻辑滞留（#4389）。
         div {
-            style: "position: absolute; left: 0; top: 0; transform-origin: 0 0; transform: translate({vp.x}px, {vp.y}px) scale({vp.zoom}); will-change: transform; {transition}",
+            class: if animate { "flow-frame flow-frame--animate" } else { "flow-frame" },
+            style: "position: absolute; left: 0; top: 0; transform-origin: 0 0; transform: translate({vp.x}px, {vp.y}px) scale({vp.zoom}); will-change: transform;",
             onmounted: move |event| {
                 *frame_ref.borrow_mut() =
                     // MountedData 的 backing 是 web_sys::Element，
