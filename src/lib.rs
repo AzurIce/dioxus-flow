@@ -236,9 +236,11 @@ impl PanSession {
                 vp.y = ny;
                 *latest.borrow_mut() = vp;
                 if let Some(el) = frame.borrow().as_ref() {
-                    let _ = el
-                        .style()
-                        .set_property("transform", &format!("translate({nx}px, {ny}px)"));
+                    // 单层 transform：必须带上 scale，否则缩放会被重置
+                    let _ = el.style().set_property(
+                        "transform",
+                        &format!("translate({nx}px, {ny}px) scale({})", vp.zoom),
+                    );
                 }
                 if let Some(el) = dots.borrow().as_ref() {
                     let (bg_x, bg_y) = dots_position(vp);
@@ -524,7 +526,7 @@ fn ViewportFrame(
 ) -> Element {
     let vp = viewport();
     let transition = if animate {
-        "transition: transform 0.35s ease, zoom 0.35s ease;"
+        "transition: transform 0.35s ease;"
     } else {
         ""
     };
@@ -541,8 +543,12 @@ fn ViewportFrame(
                         .map(|el| el.unchecked_into::<web_sys::HtmlElement>());
             },
         }
+        // 单层 transform（translate+scale，origin 0 0），与 xyflow 同构：
+        // 不用 CSS zoom——zoom 在 composited transform 层内的重绘行为
+        // 在非标准边界上，会导致子树不随 transform 即时移动。
+        // scale 期间文字短暂模糊，停止缩放后浏览器会按最终比例重光栅。
         div {
-            style: "position: absolute; left: 0; top: 0; transform: translate({vp.x}px, {vp.y}px); will-change: transform; {transition}",
+            style: "position: absolute; left: 0; top: 0; transform-origin: 0 0; transform: translate({vp.x}px, {vp.y}px) scale({vp.zoom}); will-change: transform; {transition}",
             onmounted: move |event| {
                 *frame_ref.borrow_mut() =
                     // MountedData 的 backing 是 web_sys::Element，
@@ -550,10 +556,7 @@ fn ViewportFrame(
                     event.data().downcast::<web_sys::Element>().cloned()
                         .map(|el| el.unchecked_into::<web_sys::HtmlElement>());
             },
-            div {
-                style: "zoom: {vp.zoom}; {transition}",
-                {children}
-            }
+            {children}
         }
     }
 }
