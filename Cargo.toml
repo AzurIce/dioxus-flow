@@ -1,0 +1,23 @@
+[package]
+name = "dioxus-flow"
+version = "0.1.0"
+edition = "2024"
+description = "A small, business-agnostic node canvas for Dioxus Web: pan/zoom viewport, draggable nodes, SVG bezier edges"
+license = "MIT"
+repository = "https://github.com/AzurIce/dioxus-flow"
+keywords = ["dioxus", "canvas", "graph", "flow", "nodes"]
+categories = ["gui", "web-programming"]
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "CssStyleDeclaration",
+    "DomRect",
+    "Element",
+    "Event",
+    "HtmlElement",
+    "MouseEvent",
+    "WheelEvent",
+    "Window",
+] }
