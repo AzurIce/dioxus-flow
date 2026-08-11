@@ -181,11 +181,25 @@ impl Drop for WindowReleaseListener {
     }
 }
 
+/// 点阵背景的 SVG 平铺贴片（一次光栅化，移动只是贴图位移；
+/// 不要用 CSS 渐变做逐帧动画——渐变每帧都会重光栅）。
+const DOTS_TILE: &str = "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'><circle cx='2' cy='2' r='1.4' fill='%2394a3b8' fill-opacity='0.45'/></svg>\")";
+
+/// 点阵位置（视口坐标，随平移取模循环）
+fn dots_position(viewport: Viewport) -> (f64, f64) {
+    let size = 20.0 * viewport.zoom;
+    (
+        viewport.x.rem_euclid(size),
+        viewport.y.rem_euclid(size),
+    )
+}
+
 /// 一次平移拖拽会话：window 级原生 pointermove/pointerup 监听。
 ///
-/// 绕过 Dioxus 事件层——高频 mousemove 经框架事件反序列化 + 渲染调度是
-/// 拖拽不跟手的来源。事件内同步写 transform（合成器层），并同步更新
-/// viewport signal 保持状态一致（随后的重渲染写出相同值，不会跳变）。
+/// 绕过 Dioxus 事件层——高频指针事件经框架事件反序列化 + 渲染调度是
+/// 拖拽不跟手的来源。事件内同步直写 transform（场景，合成器层）与
+/// background-position（点阵，贴图位移），并同步更新 viewport signal
+/// 保持状态一致（随后的重渲染写出相同值，不会跳变）。
 struct PanSession {
     window: web_sys::Window,
     move_cb: Closure<dyn FnMut(web_sys::PointerEvent)>,
@@ -197,6 +211,7 @@ impl PanSession {
         viewport: Signal<Viewport>,
         start: Point,
         frame: Rc<RefCell<Option<web_sys::HtmlElement>>>,
+        dots: Rc<RefCell<Option<web_sys::HtmlElement>>>,
         slot: Rc<RefCell<Option<PanSession>>>,
     ) -> Option<()> {
         let window = web_sys::window()?;
@@ -204,7 +219,6 @@ impl PanSession {
         let origin = Point::new(current.x, current.y);
 
         let move_cb = {
-            let frame = frame.clone();
             let mut viewport = viewport;
             Closure::wrap(Box::new(move |e: web_sys::PointerEvent| {
                 let nx = origin.x + e.client_x() as f64 - start.x;
@@ -213,6 +227,15 @@ impl PanSession {
                     let _ = el
                         .style()
                         .set_property("transform", &format!("translate({nx}px, {ny}px)"));
+                }
+                if let Some(el) = dots.borrow().as_ref() {
+                    let mut vp = viewport();
+                    vp.x = nx;
+                    vp.y = ny;
+                    let (bg_x, bg_y) = dots_position(vp);
+                    let _ = el
+                        .style()
+                        .set_property("background-position", &format!("{bg_x}px {bg_y}px"));
                 }
                 let mut vp = viewport();
                 vp.x = nx;
@@ -353,9 +376,11 @@ pub fn FlowCanvas(
     // 平移拖拽会话（原生 pointer 事件驱动）
     let pan_session = use_hook(|| Rc::new(RefCell::new(None::<PanSession>)));
     let pan_for_down = pan_session.clone();
-    // 平移变换层的 DOM 引用（ViewportFrame 挂载时写入），用于拖拽期间同步直写样式
+    // 平移变换层 / 点阵层的 DOM 引用（ViewportFrame 挂载时写入），用于拖拽期间同步直写样式
     let frame_element = use_hook(|| Rc::new(RefCell::new(None::<web_sys::HtmlElement>)));
     let frame_for_down = frame_element.clone();
+    let dots_element = use_hook(|| Rc::new(RefCell::new(None::<web_sys::HtmlElement>)));
+    let dots_for_down = dots_element.clone();
     let is_empty = nodes.is_empty();
     // 注意：本组件刻意不读取 viewport signal（仅事件回调里写/读）。
     // 视口订阅隔离在 ViewportFrame 内，平移/缩放的每一帧只重渲染那三个 div，
@@ -389,7 +414,13 @@ pub fn FlowCanvas(
                 let point = client_point(&event);
                 event.prevent_default();
                 // 平移：启动原生 pointer 事件会话（绕过框架事件层，保证跟手）
-                PanSession::start(viewport, point, frame_for_down.clone(), pan_for_down.clone());
+                PanSession::start(
+                    viewport,
+                    point,
+                    frame_for_down.clone(),
+                    dots_for_down.clone(),
+                    pan_for_down.clone(),
+                );
             },
             onmousemove: move |event| {
                 let state = drag_for_canvas_move.borrow().clone();
@@ -430,6 +461,7 @@ pub fn FlowCanvas(
                 viewport,
                 animate,
                 frame_ref: frame_element.clone(),
+                dots_ref: dots_element.clone(),
                 FlowScene {
                     nodes,
                     edges,
@@ -451,13 +483,14 @@ pub fn FlowCanvas(
 /// 视口帧：唯一订阅 viewport signal 的组件。
 /// 平移 = transform: translate（合成器层，无 layout/repaint）；
 /// 缩放 = CSS zoom（重栅格化保证文字清晰）。
-/// 点阵背景放在变换层内部（图坐标固定点距），随平移/缩放自然移动，
-/// 不做 background-position/size 的逐帧更新（渐变重光栅是性能陷阱）。
+/// 点阵背景是视口大小的 SVG 贴片层（不占合成器大图层），
+/// 通过 background-position 位移跟随平移。
 #[component]
 fn ViewportFrame(
     viewport: Signal<Viewport>,
     animate: bool,
     frame_ref: Rc<RefCell<Option<web_sys::HtmlElement>>>,
+    dots_ref: Rc<RefCell<Option<web_sys::HtmlElement>>>,
     children: Element,
 ) -> Element {
     let vp = viewport();
@@ -466,7 +499,16 @@ fn ViewportFrame(
     } else {
         ""
     };
+    let bg_size = 20.0 * vp.zoom;
+    let (bg_x, bg_y) = dots_position(vp);
     rsx! {
+        div {
+            style: "position: absolute; inset: 0; pointer-events: none; background-image: {DOTS_TILE}; background-repeat: repeat; background-size: {bg_size}px {bg_size}px; background-position: {bg_x}px {bg_y}px;",
+            onmounted: move |event| {
+                *dots_ref.borrow_mut() =
+                    event.data().downcast::<web_sys::HtmlElement>().cloned();
+            },
+        }
         div {
             style: "position: absolute; left: 0; top: 0; transform: translate({vp.x}px, {vp.y}px); will-change: transform; {transition}",
             onmounted: move |event| {
@@ -475,10 +517,6 @@ fn ViewportFrame(
             },
             div {
                 style: "zoom: {vp.zoom}; {transition}",
-                // 点阵背景：图坐标固定 20px 点距，覆盖以原点为中心的大范围区域
-                div {
-                    style: "position: absolute; left: -5000px; top: -5000px; width: 10000px; height: 10000px; pointer-events: none; background-image: radial-gradient(circle, color-mix(in srgb, currentColor 18%, transparent) 1px, transparent 1px); background-size: 20px 20px;",
-                }
                 {children}
             }
         }

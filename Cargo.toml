@@ -1,6 +1,6 @@
 [package]
 name = "dioxus-flow"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 description = "A small, business-agnostic node canvas for Dioxus Web: pan/zoom viewport, draggable nodes, SVG bezier edges"
 license = "MIT"
