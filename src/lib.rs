@@ -243,11 +243,10 @@ impl PanSession {
                 vp.y = ny;
                 *latest.borrow_mut() = vp;
                 if let Some(el) = frame.borrow().as_ref() {
-                    // 单层 transform：必须带上 scale，否则缩放会被重置
-                    let _ = el.style().set_property(
-                        "transform",
-                        &format!("translate({nx}px, {ny}px) scale({})", vp.zoom),
-                    );
+                    // 纯平移直写（缩放在内层 zoom div 上，不受影响）
+                    let _ = el
+                        .style()
+                        .set_property("transform", &format!("translate({nx}px, {ny}px)"));
                 }
                 if let Some(el) = dots.borrow().as_ref() {
                     let (bg_x, bg_y) = dots_position(vp);
@@ -550,15 +549,13 @@ fn ViewportFrame(
                         .map(|el| el.unchecked_into::<web_sys::HtmlElement>());
             },
         }
-        // 单层 transform（translate+scale，origin 0 0），与 xyflow 同构：
-        // 不用 CSS zoom——zoom 在 composited transform 层内的重绘行为
-        // 在非标准边界上，会导致子树不随 transform 即时移动。
-        // scale 期间文字短暂模糊，停止缩放后浏览器会按最终比例重光栅。
+        // 平移与缩放分离：translate 走合成器（跟手），CSS zoom 每次变更
+        // 都会重光栅（文字始终清晰，无 transform: scale 的位图模糊）。
         // 过渡动画用 class 控制（.flow-frame--animate 由调用方 CSS 提供）——
         // 内联 style 的 transition 会被 Dioxus 的 style 保存/恢复逻辑滞留（#4389）。
         div {
             class: if animate { "flow-frame flow-frame--animate" } else { "flow-frame" },
-            style: "position: absolute; left: 0; top: 0; transform-origin: 0 0; transform: translate({vp.x}px, {vp.y}px) scale({vp.zoom}); will-change: transform;",
+            style: "position: absolute; left: 0; top: 0; transform: translate({vp.x}px, {vp.y}px); will-change: transform;",
             onmounted: move |event| {
                 *frame_ref.borrow_mut() =
                     // MountedData 的 backing 是 web_sys::Element，
@@ -566,7 +563,11 @@ fn ViewportFrame(
                     event.data().downcast::<web_sys::Element>().cloned()
                         .map(|el| el.unchecked_into::<web_sys::HtmlElement>());
             },
-            {children}
+            div {
+                class: "flow-zoom",
+                style: "zoom: {vp.zoom};",
+                {children}
+            }
         }
     }
 }
