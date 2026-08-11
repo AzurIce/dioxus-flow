@@ -143,10 +143,6 @@ pub struct NodeMove {
 
 #[derive(Clone, Debug, PartialEq)]
 enum DragState {
-    Pan {
-        start: Point,
-        origin: Point,
-    },
     Node {
         id: NodeId,
         start: Point,
@@ -182,6 +178,86 @@ impl Drop for WindowReleaseListener {
                 self.callback.as_ref().unchecked_ref(),
             );
         }
+    }
+}
+
+/// 一次平移拖拽会话：window 级原生 pointermove/pointerup 监听。
+///
+/// 绕过 Dioxus 事件层——高频 mousemove 经框架事件反序列化 + 渲染调度是
+/// 拖拽不跟手的来源。事件内同步写 transform（合成器层），并同步更新
+/// viewport signal 保持状态一致（随后的重渲染写出相同值，不会跳变）。
+struct PanSession {
+    window: web_sys::Window,
+    move_cb: Closure<dyn FnMut(web_sys::PointerEvent)>,
+    up_cb: Closure<dyn FnMut(web_sys::PointerEvent)>,
+}
+
+impl PanSession {
+    fn start(
+        viewport: Signal<Viewport>,
+        start: Point,
+        frame: Rc<RefCell<Option<web_sys::HtmlElement>>>,
+        slot: Rc<RefCell<Option<PanSession>>>,
+    ) -> Option<()> {
+        let window = web_sys::window()?;
+        let current = viewport();
+        let origin = Point::new(current.x, current.y);
+
+        let move_cb = {
+            let frame = frame.clone();
+            let mut viewport = viewport;
+            Closure::wrap(Box::new(move |e: web_sys::PointerEvent| {
+                let nx = origin.x + e.client_x() as f64 - start.x;
+                let ny = origin.y + e.client_y() as f64 - start.y;
+                if let Some(el) = frame.borrow().as_ref() {
+                    let _ = el
+                        .style()
+                        .set_property("transform", &format!("translate({nx}px, {ny}px)"));
+                }
+                let mut vp = viewport();
+                vp.x = nx;
+                vp.y = ny;
+                viewport.set(vp);
+            }) as Box<dyn FnMut(_)>)
+        };
+        let up_cb = {
+            let slot = slot.clone();
+            Closure::wrap(Box::new(move |_e: web_sys::PointerEvent| {
+                // 从 slot 中移除监听器（取走会顺带 drop，先显式 remove）
+                if let Some(session) = slot.borrow_mut().take() {
+                    session.remove();
+                }
+            }) as Box<dyn FnMut(_)>)
+        };
+        let _ = window.add_event_listener_with_callback(
+            "pointermove",
+            move_cb.as_ref().unchecked_ref(),
+        );
+        let _ = window
+            .add_event_listener_with_callback("pointerup", up_cb.as_ref().unchecked_ref());
+        *slot.borrow_mut() = Some(PanSession {
+            window,
+            move_cb,
+            up_cb,
+        });
+        Some(())
+    }
+
+    fn remove(&self) {
+        let _ = self.window.remove_event_listener_with_callback(
+            "pointermove",
+            self.move_cb.as_ref().unchecked_ref(),
+        );
+        let _ = self.window.remove_event_listener_with_callback(
+            "pointerup",
+            self.up_cb.as_ref().unchecked_ref(),
+        );
+    }
+}
+
+impl Drop for PanSession {
+    fn drop(&mut self) {
+        self.remove();
     }
 }
 
@@ -269,15 +345,17 @@ pub fn FlowCanvas(
     let drag_for_window = drag.clone();
     let _window_release_listener =
         use_hook(move || WindowReleaseListener::install(drag_for_window));
-    let drag_for_canvas_down = drag.clone();
     let drag_for_canvas_move = drag.clone();
     let drag_for_canvas_up = drag.clone();
     let canvas_element = use_hook(|| Rc::new(RefCell::new(None::<web_sys::Element>)));
     let canvas_for_mount = canvas_element.clone();
     let canvas_for_wheel = canvas_element.clone();
+    // 平移拖拽会话（原生 pointer 事件驱动）
+    let pan_session = use_hook(|| Rc::new(RefCell::new(None::<PanSession>)));
+    let pan_for_down = pan_session.clone();
     // 平移变换层的 DOM 引用（ViewportFrame 挂载时写入），用于拖拽期间同步直写样式
     let frame_element = use_hook(|| Rc::new(RefCell::new(None::<web_sys::HtmlElement>)));
-    let frame_for_move = frame_element.clone();
+    let frame_for_down = frame_element.clone();
     let is_empty = nodes.is_empty();
     // 注意：本组件刻意不读取 viewport signal（仅事件回调里写/读）。
     // 视口订阅隔离在 ViewportFrame 内，平移/缩放的每一帧只重渲染那三个 div，
@@ -309,35 +387,15 @@ pub fn FlowCanvas(
                 let Some(native) = event_data.downcast::<web_sys::MouseEvent>() else { return; };
                 if native.button() != 0 { return; }
                 let point = client_point(&event);
-                let current = viewport();
                 event.prevent_default();
-                *drag_for_canvas_down.borrow_mut() = Some(DragState::Pan {
-                    start: point,
-                    origin: Point::new(current.x, current.y),
-                });
+                // 平移：启动原生 pointer 事件会话（绕过框架事件层，保证跟手）
+                PanSession::start(viewport, point, frame_for_down.clone(), pan_for_down.clone());
             },
             onmousemove: move |event| {
                 let state = drag_for_canvas_move.borrow().clone();
                 let Some(state) = state else { return; };
                 let point = client_point(&event);
                 match state {
-                    DragState::Pan { start, origin, .. } => {
-                        let current = viewport();
-                        let next = Viewport {
-                            x: origin.x + point.x - start.x,
-                            y: origin.y + point.y - start.y,
-                            zoom: current.zoom,
-                        };
-                        // 同步直写 transform（合成器层，无 layout/repaint），
-                        // 消除渲染调度延迟；signal 随后渲染出相同样式，不会跳变。
-                        if let Some(el) = frame_for_move.borrow().as_ref() {
-                            let _ = el.style().set_property(
-                                "transform",
-                                &format!("translate({}px, {}px)", next.x, next.y),
-                            );
-                        }
-                        viewport.set(next);
-                    }
                     DragState::Node {
                         id,
                         start,
