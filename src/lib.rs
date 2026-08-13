@@ -48,6 +48,32 @@ impl From<&str> for NodeId {
     }
 }
 
+/// 节点内容渲染回调。
+///
+/// 不能用 `Callback`：Dioxus 0.7 的 props memoize 会把 `Callback`/`EventHandler`
+/// 字段 `__point_to` 原地替换——句柄身份不变、不参与相等比较。这对事件回调是
+/// 合理优化，但对渲染回调是 bug：闭包每次渲染都是新的（捕获了最新状态），下游
+/// 组件看到的句柄却不变，props 被判相等而跳过重渲，节点内容停留在旧状态。
+/// 作为普通字段按 `Rc` 指针比较：调用方新建闭包即视为内容变更，触发重渲。
+#[derive(Clone)]
+pub struct RenderNode(pub Rc<dyn Fn(NodeId) -> Element>);
+
+impl PartialEq for RenderNode {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl RenderNode {
+    pub fn new(f: impl Fn(NodeId) -> Element + 'static) -> Self {
+        Self(Rc::new(f))
+    }
+
+    fn call(&self, id: NodeId) -> Element {
+        (self.0)(id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Point {
     pub x: f64,
@@ -385,7 +411,7 @@ pub fn FlowCanvas(
     nodes: Vec<FlowNode>,
     edges: Vec<FlowEdge>,
     mut viewport: Signal<Viewport>,
-    render_node: Callback<NodeId, Element>,
+    render_node: RenderNode,
     on_node_move: EventHandler<NodeMove>,
     on_node_click: EventHandler<NodeId>,
     #[props(default = String::new())] class: String,
@@ -579,7 +605,7 @@ fn FlowScene(
     marker_id: String,
     edge_color: String,
     drag: Rc<RefCell<Option<DragState>>>,
-    render_node: Callback<NodeId, Element>,
+    render_node: RenderNode,
     on_node_click: EventHandler<NodeId>,
 ) -> Element {
     let by_id = nodes
