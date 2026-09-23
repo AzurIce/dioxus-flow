@@ -1,5 +1,8 @@
 # dioxus-flow
 
+> [!NOTE]
+> ARCHIVED — check out [dioxus-flow](https://crates.io/crates/dioxus-flow) by [XiangpengHao](https://github.com/XiangpengHao) instead, it's great.
+
 一个业务无关的 Dioxus Web 节点画布组件：视口平移/缩放、节点拖拽、SVG 贝塞尔边。
 调用方持有节点数据、布局与节点内容，画布只管视口交互和边的渲染。
 
